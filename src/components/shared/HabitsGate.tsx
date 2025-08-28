@@ -1,28 +1,33 @@
-import React, { useEffect, useState, useCallback } from 'react';
+import React, { useEffect, useState, useCallback, useRef } from 'react';
 import { supabase, getCurrentSession } from '../../lib/supabase';
 
 type State = 'boot' | 'authLoading' | 'noSession' | 'loading' | 'ready' | 'error';
 
-/**
- * Hace un “ping” muy barato a la tabla para comprobar
- * que la sesión y la BD responden. No usa helpers ni timeout.
- */
 async function pingHabits(userId: string) {
-  const { error: pingError } = await supabase
+  const { error } = await supabase
     .from('habits')
-    .select('id', { count: 'exact', head: true }) // no trae data, solo comprueba acceso
+    .select('id', { head: true, count: 'exact' })
     .eq('user_id', userId)
     .limit(1);
-
-  if (pingError) throw pingError;
+  if (error) throw error;
 }
 
 export default function HabitsGate({ children }: { children: React.ReactNode }) {
   const [state, setState] = useState<State>('boot');
   const [msg, setMsg] = useState('');
+  const [revKey, setRevKey] = useState<number>(0);   // fuerza re-montar la app
+  const loadTimer = useRef<number | null>(null);
+
+  const clearLoadTimer = () => {
+    if (loadTimer.current) {
+      window.clearTimeout(loadTimer.current);
+      loadTimer.current = null;
+    }
+  };
 
   const load = useCallback(async () => {
     try {
+      clearLoadTimer();
       setState('authLoading');
 
       const session = await getCurrentSession();
@@ -32,9 +37,22 @@ export default function HabitsGate({ children }: { children: React.ReactNode }) 
       }
 
       setState('loading');
+
+      // si en 3.5s no pasamos a 'ready', hacemos fallback (soft reload)
+      loadTimer.current = window.setTimeout(() => {
+        // re-montamos hijos (resetea loaders internos)
+        setRevKey(Date.now());
+      }, 3500);
+
       await pingHabits(session.user.id);
+
+      clearLoadTimer();
       setState('ready');
+
+      // al quedar 'ready', también forzamos re-montaje por si algún loader interno quedó colgado
+      setRevKey(Date.now());
     } catch (e: any) {
+      clearLoadTimer();
       console.error(e);
       setMsg(e?.message ?? 'Failed to load');
       setState('error');
@@ -44,18 +62,15 @@ export default function HabitsGate({ children }: { children: React.ReactNode }) 
   useEffect(() => {
     load();
 
-    // Revalidar al volver a la pestaña
-    const onVisible = () => {
-      if (document.visibilityState === 'visible') load();
-    };
+    const onVisible = () => { if (document.visibilityState === 'visible') load(); };
     document.addEventListener('visibilitychange', onVisible);
 
-    // Reaccionar a cambios de sesión (login/logout/refresh)
     const { data: sub } = supabase.auth.onAuthStateChange(() => load());
 
     return () => {
       document.removeEventListener('visibilitychange', onVisible);
       sub.subscription.unsubscribe();
+      clearLoadTimer();
     };
   }, [load]);
 
@@ -82,5 +97,7 @@ export default function HabitsGate({ children }: { children: React.ReactNode }) 
     );
   }
 
-  return <>{children}</>;
+  // clave: renderizamos los hijos con una key que cambia al volver a la pestaña,
+  // forzando que se desmonten/monten (resetea sus loaders internos).
+  return <div key={revKey}>{children}</div>;
 }
